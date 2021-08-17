@@ -19,7 +19,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 MAP_URLS = {
-    "google": "http://mt{server}.google.cn/vt/lyrs={style}&hl=zh-CN&gl=CN&src=app&x={x}&y={y}&z={z}",
+    "google": "http://mt{server}.google.cn/vt/lyrs={style}&hl=zh-CN{offset}&src=app&x={x}&y={y}&z={z}",
     "amap": "http://wprd02.is.autonavi.com/appmaptile?style={style}&x={x}&y={y}&z={z}",
     "tencent_s": "http://p3.map.gtimg.com/sateTiles/{z}/{fx}/{fy}/{x}_{y}.jpg",
     "tencent_m": "http://rt0.map.gtimg.com/tile?z={z}&x={x}&y={y}&styleid=3"
@@ -34,7 +34,7 @@ mutex = Lock()
 # WGS-84经纬度转Web墨卡托
 
 
-def wgs_to_macator(x, y):
+def wgs_to_mercator(x, y):
     y = 85.0511287798 if y > 85.0511287798 else y
     y = -85.0511287798 if y < -85.0511287798 else y
 
@@ -46,7 +46,7 @@ def wgs_to_macator(x, y):
 # Web墨卡托转经纬度
 
 
-def mecator_to_wgs(x, y):
+def mercator_to_wgs(x, y):
     x2 = x / 20037508.34 * 180
     y2 = y / 20037508.34 * 180
     y2 = 180 / math.pi * \
@@ -149,6 +149,107 @@ def parse_dms(dms):
     return (lat)
 
 
+# -------------------栅格像素到墨卡托----------------------------
+
+def imagexy2geo(trans, u, v):
+    '''
+    根据GDAL的六参数模型将影像图上坐标（行列号）转为投影坐标或地理坐标（根据具体数据的坐标系统转换）
+    :param trans: GDAL地理转换矩阵
+    :param v: 像素的行号
+    :param u: 像素的列号
+    :return: 行列号(v, u)对应的投影坐标或地理坐标(x, y)
+    '''
+    px = trans[0] + u * trans[1] + v * trans[2]
+    py = trans[3] + u * trans[4] + v * trans[5]
+    return px, py
+
+
+def geo2imagexy(trans, x, y):
+    '''
+    根据GDAL的六 参数模型将给定的投影或地理坐标转为影像图上坐标（行列号）
+    :param dataset: GDAL地理转换矩阵
+    :param x: 投影或地理坐标x
+    :param y: 投影或地理坐标y
+    :return: 影坐标或地理坐标(x, y)对应的影像图上行列号(v, u)
+    '''
+    a = np.array([[trans[1], trans[2]], [trans[4], trans[5]]])
+    b = np.array([x - trans[0], y - trans[3]])
+    uv = np.linalg.solve(a, b)  # 使用numpy的linalg.solve进行二元一次方程的求解
+
+    return int(np.floor(uv[0])), int(np.floor(uv[1]))
+
+# -----------------GCJ02到WGS84的纠偏与互转---------------------------
+
+
+def transformLat(x, y):
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * \
+        y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 *
+            math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 *
+            math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 *
+            math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def transformLon(x, y):
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + \
+        0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 *
+            math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 *
+            math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 *
+            math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def delta(lat, lon):
+    ''' 
+    Krasovsky 1940
+    //
+    // a = 6378245.0, 1/f = 298.3
+    // b = a * (1 - f)
+    // ee = (a^2 - b^2) / a^2;
+    '''
+    a = 6378245.0  # a: 卫星椭球坐标投影到平面地图坐标系的投影因子。
+    ee = 0.00669342162296594323  # ee: 椭球的偏心率。
+    dLat = transformLat(lon - 105.0, lat - 35.0)
+    dLon = transformLon(lon - 105.0, lat - 35.0)
+    radLat = lat / 180.0 * math.pi
+    magic = math.sin(radLat)
+    magic = 1 - ee * magic * magic
+    sqrtMagic = math.sqrt(magic)
+    dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * math.pi)
+    dLon = (dLon * 180.0) / (a / sqrtMagic * math.cos(radLat) * math.pi)
+    return {'lat': dLat, 'lon': dLon}
+
+
+def outOfChina(lat, lon):
+    if (lon < 72.004 or lon > 137.8347):
+        return True
+    if (lat < 0.8293 or lat > 55.8271):
+        return True
+    return False
+
+
+def gcj_to_wgs(gcjLon, gcjLat):
+    if outOfChina(gcjLat, gcjLon):
+        return (gcjLon, gcjLat)
+    d = delta(gcjLat, gcjLon)
+    return (gcjLon - d["lon"], gcjLat - d["lat"])
+
+
+def wgs_to_gcj(wgsLon, wgsLat):
+    if outOfChina(wgsLat, wgsLon):
+        return wgsLon, wgsLat
+    d = delta(wgsLat, wgsLon)
+    return wgsLon + d["lon"], wgsLat + d["lat"]
+
+# --------------------------------------------------------------
+
+
 # ---------------------下载器相关-----------------------------
 agents = [
     'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36',
@@ -232,7 +333,7 @@ def downTiles(urls, multi=10):
     return datas
 
 
-def geturl(source, x, y, z, style):
+def geturl(source, x, y, z, style, offset):
     '''
     Get the picture's url for download.
     style:
@@ -246,8 +347,9 @@ def geturl(source, x, y, z, style):
         zoom
     '''
     if source == 'google':
+        offset = '&gl=CN' if offset else ''
         furl = MAP_URLS["google"].format(
-            server='{server}', x=x, y=y, z=z, style=style)
+            server='{server}', x=x, y=y, z=z, style=style, offset=offset)
     elif source == 'amap':
         # for amap 6 is satellite and 7 is map.
         style = 6 if style == 's' else 7
@@ -285,11 +387,11 @@ def getTilesByBBox(bbox, zoom):
     return tiles, [pos1x, pos1y, pos2x, pos2y], [leny*256, lenx*256]
 
 
-def getUrlsByTiles(tiles, tile_bbox, zoom, source='google', style='s'):
+def getUrlsByTiles(tiles, tile_bbox, zoom, source='google', style='s', offset=False):
     pos1x, pos1y, pos2x, pos2y = tile_bbox
     urls = []
     for x, y in tiles:
-        url = geturl(source, x, y, zoom, style)
+        url = geturl(source, x, y, zoom, style, offset)
         urls.append([x-pos1x, y-pos1y, url])
     return urls
 
@@ -329,6 +431,7 @@ def saveTif(datas, im_geotrans, image_shape, outfile):
     datatype = gdal.GDT_Byte
     driver = gdal.GetDriverByName("GTiff")
     dataset = driver.Create(outfile, width, height, 3, datatype)
+    print('save', outfile)
     if(dataset != None):
         dataset.SetGeoTransform(im_geotrans)  # 写入仿射变换参数
         # dataset.SetProjection(im_proj) #写入投影
@@ -351,30 +454,160 @@ def saveTif(datas, im_geotrans, image_shape, outfile):
 
     del dataset
 
+# ---------------------2019全国行政区域-----------------------------
+
+
+def getShpFile(shapefilename):
+
+    shp = shapefile.Reader(shapefilename)
+    border_shapes = shp.shapes()
+    area_infors = shp.records()
+    return border_shapes, area_infors
+
+
+def initBorder():
+    county_border_shapes, county_area_infors = getShpFile(
+        "D:\\迅雷下载\\区划\\区划\\县.shp")
+    city_border_shapes, city_area_infors = getShpFile(
+        "D:\\迅雷下载\\区划\\区划\\市.shp")
+    province_border_shapes, province_area_infors = getShpFile(
+        "D:\\迅雷下载\\区划\\区划\\省.shp")
+
+    return [[county_border_shapes, county_area_infors],
+            [city_border_shapes, city_area_infors],
+            [province_border_shapes, province_area_infors]]
+
+
+def getBoarderFromDataset(name, dataset):
+
+    for border_shapes, area_infors in dataset:
+        for area_infor, border in zip(area_infors, border_shapes):
+            if name in area_infor[1]:
+                query_city_infor = area_infor
+                query_border_infor = border
+                print('query', area_infor, border.bbox)
+                return query_border_infor, query_city_infor
+    return None
+
 
 def downloadRectDemo():
     source = 'google'
     style = 's'
     zoom = 18
+    offset = False
     geo_name = 'test'
     gps_bbox = [120.09198099000002, 27.176422685000115,
                 120.09819027500012, 27.173431772500086]
 
     tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
-    urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style)
+    urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
 
     mercator_bbox = getExtent(tile_bbox, zoom, mode='tile')
     trans = getTransform(mercator_bbox, image_shape)
-    print(trans)
+    print('mercator bbox is', mercator_bbox)
+    print('geotransform is', trans)
     # print(image_shape)
     datas = downTiles(urls)
 
     print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
           (image_shape[0], image_shape[1]))
 
-    outfile = '{}_{}{}_{}.tif'.format(source, zoom, style, geo_name)
+    gl = 'gl' if offset else ' nogl'
+    outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
     saveTif(datas, trans, image_shape, outfile)
 
 
+def downloadShpDemo():
+    source = 'google'
+    style = 's'
+    zoom = 18
+    offset = False
+    geo_name = '苍南县'
+
+    datasets = initBorder()
+    boarders = getBoarderFromDataset(geo_name, datasets)
+    if boarders is None:
+        print('not find', geo_name)
+        return
+
+    query_border_infor, query_city_infor = boarders
+
+    geo_bbox = query_border_infor.bbox
+    w_lon = geo_bbox[0]
+    n_lat = geo_bbox[3]
+    e_lon = geo_bbox[2]
+    s_lat = geo_bbox[1]
+
+    gps_bbox = [w_lon, n_lat,
+                e_lon, s_lat]
+    print(gps_bbox)
+    gps_bbox = [120.09198099000002, 27.176422685000115,
+                120.09819027500012, 27.173431772500086]
+
+    tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
+    urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
+
+    mercator_bbox = getExtent(tile_bbox, zoom, mode='tile')
+    trans = getTransform(mercator_bbox, image_shape)
+    print('mercator bbox is', mercator_bbox)
+    print('geotransform is', trans)
+    datas = downTiles(urls)
+
+    print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
+          (image_shape[0], image_shape[1]))
+
+    gl = 'gl' if offset else ' nogl'
+    outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
+    saveTif(datas, trans, image_shape, outfile)
+
+
+def downloadShpDemo2():
+
+    source = 'google'
+    style = 's'
+    zoom = 18
+    offset = False
+    geo_name = '苍南县'
+
+    datasets = initBorder()
+    boarders = getBoarderFromDataset(geo_name, datasets)
+    if boarders is None:
+        print('not find', geo_name)
+        return
+
+    query_border_infor, query_city_infor = boarders
+
+    geo_bbox = query_border_infor.bbox
+    w_lon = geo_bbox[0]
+    n_lat = geo_bbox[3]
+    e_lon = geo_bbox[2]
+    s_lat = geo_bbox[1]
+
+    gps_bbox = [w_lon, n_lat,
+                e_lon, s_lat]
+    print(gps_bbox)
+    gps_bbox = [120.09198099000002, 27.176422685000115,
+                120.09819027500012, 27.173431772500086]
+
+    tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
+    urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
+
+    mercator_bbox = getExtent(tile_bbox, zoom, mode='tile')
+    trans = getTransform(mercator_bbox, image_shape)
+    print('mercator bbox is', mercator_bbox)
+    print('geotransform is', trans)
+    datas = downTiles(urls)
+
+    print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
+          (image_shape[0], image_shape[1]))
+
+    points = []
+    for point in query_border_infor.points:
+        x,y = wgs_to_mercator(point[0], point[1])
+        x,y = geo2imagexy(x, y)
+        points.append([x, y])
+    # TODO 制作mask，裁剪
+
 if __name__ == "__main__":
-    downloadRectDemo()
+    # downloadRectDemo()
+    downloadShpDemo()
