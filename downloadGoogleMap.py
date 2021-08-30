@@ -1,15 +1,19 @@
-import os
 import io
+import cv2
+import os
 import sys
 import random
 import re
 import math
+import json
 import shapefile
+from osgeo import ogr
 from threading import Thread, Lock
 import urllib.request as ur
 import numpy as np
 from matplotlib import pyplot as plt
 from osgeo import gdal
+
 
 from PIL import Image
 from PIL import ImageFile
@@ -417,6 +421,7 @@ def getTransform(mercator_bbox, image_shape):
     height, width = image_shape
     mercator_x1, mercator_y1, mercator_x2, mercator_y2 = mercator_bbox
 
+    # print((mercator_x2 - mercator_x1), (mercator_y2 - mercator_y1))
     res_x = (mercator_x2 - mercator_x1) / width
     res_y = (mercator_y2 - mercator_y1) / height
 
@@ -425,13 +430,14 @@ def getTransform(mercator_bbox, image_shape):
     return trans
 
 
-def saveTif(datas, im_geotrans, image_shape, outfile):
+def saveTif(datas, im_geotrans, image_shape, outfile, mask=None):
     # 创建文件
     height, width = image_shape
     datatype = gdal.GDT_Byte
     driver = gdal.GetDriverByName("GTiff")
     dataset = driver.Create(outfile, width, height, 3, datatype)
     print('save', outfile)
+    bands = 0
     if(dataset != None):
         dataset.SetGeoTransform(im_geotrans)  # 写入仿射变换参数
         # dataset.SetProjection(im_proj) #写入投影
@@ -452,10 +458,35 @@ def saveTif(datas, im_geotrans, image_shape, outfile):
                 dataset.GetRasterBand(
                     c + 1).WriteArray(data[:, :, c], x*256, y*256)
 
+    if mask is not None:
+        for c in range(bands):
+            band_data = dataset.GetRasterBand(
+                c + 1).ReadAsArray(0, 0, width, height)
+            band_data[mask == 0] = 0
+            dataset.GetRasterBand(
+                c + 1).WriteArray(band_data, 0, 0)
+
     del dataset
 
-# ---------------------2019全国行政区域-----------------------------
 
+def createMaskFromPoints(mercator_list, width, height):
+    mask = np.zeros((height, width), np.uint8)
+
+    for points_list in mercator_list:
+        num = len(points_list)
+        for idx in range(num):
+            fill_value = 0
+            if idx == 0:
+                fill_value = 1
+            else:
+                fill_value = 0
+            mask = cv2.fillPoly(mask, [np.array(points_list[idx])], fill_value)
+    cv2.imshow("mask", mask*255)
+    cv2.waitKey(0)
+    return mask
+
+
+# ---------------------2019全国行政区域shape文件读取-----------------------------
 
 def getShpFile(shapefilename):
 
@@ -488,6 +519,74 @@ def getBoarderFromDataset(name, dataset):
                 print('query', area_infor, border.bbox)
                 return query_border_infor, query_city_infor
     return None
+
+
+# 使用gdal读取shapefile
+def getShpFileByGDAL(shapefile, query_name):
+    '''
+    结果保存方式为b,c,h,w
+    b为有多少个区域
+    c为区域轮廓个数，例如c=1，表示只有一个外轮廓，无空洞；c=2，表示下标为0的位置为外轮廓，下标为1的位置为外轮廓，除了0以外都是外轮廓
+    h为轮廓点的个数
+    w为2，表示经纬度
+    '''
+    # 支持中文路径
+    gdal.SetConfigOption("GDAL_FILENAME_IS_UTF8", "YES")
+    # 支持中文编码
+    gdal.SetConfigOption("SHAPE_ENCODING", "UTF-8")
+    # 注册所有的驱动
+    ogr.RegisterAll()
+    # 打开数据
+    print('打开', shapefile)
+    ds = ogr.Open(shapefile, 0)
+    if ds == None:
+        return "打开文件失败！"
+
+    # 获取数据源中的图层个数，shp数据图层只有一个，gdb、dxf会有多个
+    iLayerCount = ds.GetLayerCount()
+    print("\t图层个数 = ", iLayerCount)
+    # 获取第一个图层
+    result = []
+    bbox = [10000, 10000, -10000, -10000]
+    for layerIdx in range(iLayerCount):
+        oLayer = ds.GetLayerByIndex(layerIdx)
+        if oLayer == None:
+            return "获取图层失败！"
+        # 对图层进行初始化
+        oLayer.ResetReading()
+        # 输出图层中的要素个数
+        num = oLayer.GetFeatureCount(0)
+        print("\t要素个数 = ", num)
+        result_list = []
+        # 获取要素
+        for i in range(0, num):
+            ofeature = oLayer.GetFeature(i)
+            # id = ofeature.GetFieldAsString("id")
+            name = ofeature.GetFieldAsString('name')
+
+            if query_name in name:
+
+                count = ofeature.GetGeometryRef().GetGeometryCount()
+                for gemIdx in range(count):
+                    gemo = ofeature.GetGeometryRef().GetGeometryRef(gemIdx)
+                    gemo_data = gemo.ExportToJson()
+                    gemo_json = json.loads(gemo_data)
+                    gemo_np = np.array(gemo_json['coordinates'])
+                    print(name, gemo_np.shape)
+
+                    min_x = min(np.min(gemo_np[..., 0]), bbox[0])
+                    max_x = max(np.max(gemo_np[..., 0]), bbox[2])
+                    min_y = min(np.min(gemo_np[..., 1]), bbox[1])
+                    max_y = max(np.max(gemo_np[..., 1]), bbox[3])
+
+                    bbox = [min_x, min_y, max_x, max_y]
+                    result.append(gemo_np)
+                # print(dir(ofeature.GetGeometryRef()),
+                #       ofeature.GetGeometryRef().Boundary())
+
+    ds.Destroy()
+    del ds
+    return result, bbox
 
 
 def downloadRectDemo():
@@ -565,19 +664,14 @@ def downloadShpDemo2():
 
     source = 'google'
     style = 's'
-    zoom = 18
+    zoom = 12
     offset = False
     geo_name = '苍南县'
 
-    datasets = initBorder()
-    boarders = getBoarderFromDataset(geo_name, datasets)
-    if boarders is None:
-        print('not find', geo_name)
-        return
+    boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\县.shp", geo_name)
+    # boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\市.shp", geo_name)
+    # boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\省.shp", geo_name)
 
-    query_border_infor, query_city_infor = boarders
-
-    geo_bbox = query_border_infor.bbox
     w_lon = geo_bbox[0]
     n_lat = geo_bbox[3]
     e_lon = geo_bbox[2]
@@ -586,10 +680,11 @@ def downloadShpDemo2():
     gps_bbox = [w_lon, n_lat,
                 e_lon, s_lat]
     print(gps_bbox)
-    gps_bbox = [120.09198099000002, 27.176422685000115,
-                120.09819027500012, 27.173431772500086]
+    # gps_bbox = [120.09198099000002, 27.176422685000115,
+    #             120.09819027500012, 27.173431772500086]
 
     tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
+    # print(tiles, tile_bbox, image_shape)
     urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
 
     mercator_bbox = getExtent(tile_bbox, zoom, mode='tile')
@@ -601,13 +696,27 @@ def downloadShpDemo2():
     print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
           (image_shape[0], image_shape[1]))
 
-    points = []
-    for point in query_border_infor.points:
-        x,y = wgs_to_mercator(point[0], point[1])
-        x,y = geo2imagexy(x, y)
-        points.append([x, y])
-    # TODO 制作mask，裁剪
+    # 将wgs84转为墨卡托坐标
+    mercator_boundary_list = []
+    for points_list in boundary:
+        mercator_points_list = []
+        for points in points_list:
+            mercator_points = []
+            for point in points:
+                x, y = wgs_to_mercator(point[0], point[1])
+                x, y = geo2imagexy(trans, x, y)
+                mercator_points.append([x, y])
+            mercator_points_list.append(mercator_points)
+        mercator_boundary_list.append(mercator_points_list)
+
+    mask = createMaskFromPoints(
+        mercator_boundary_list, image_shape[1],  image_shape[0])
+
+    gl = 'gl' if offset else ' nogl'
+    outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
+    saveTif(datas, trans, image_shape, outfile, mask=mask)
+
 
 if __name__ == "__main__":
     # downloadRectDemo()
-    downloadShpDemo()
+    downloadShpDemo2()
