@@ -481,8 +481,8 @@ def createMaskFromPoints(mercator_list, width, height):
             else:
                 fill_value = 0
             mask = cv2.fillPoly(mask, [np.array(points_list[idx])], fill_value)
-    cv2.imshow("mask", mask*255)
-    cv2.waitKey(0)
+    # cv2.imshow("mask", mask*255)
+    # cv2.waitKey(0)
     return mask
 
 
