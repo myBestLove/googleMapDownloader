@@ -11,3 +11,5 @@
 ![image](google_12s_nogl_苍南县.jpg)
 
 2019全国行政区域[地址](https://pan.baidu.com/s/13N-febNMF01PctN3tXob-Q)，提取码：9z6d
+
+[阿里云地图选择器](http://datav.aliyun.com/tools/atlas/index.html)

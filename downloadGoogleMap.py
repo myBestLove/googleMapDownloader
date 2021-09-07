@@ -1,19 +1,22 @@
 import io
-import cv2
 import os
-import sys
-import random
 import re
+import sys
+import cv2
 import math
 import json
+import time
+import random
+import requests
 import shapefile
-from osgeo import ogr
-from threading import Thread, Lock
-import urllib.request as ur
+import geopandas
 import numpy as np
-from matplotlib import pyplot as plt
-from osgeo import gdal
+import urllib.request as ur
 
+from osgeo import gdal, ogr
+from shapely import geometry
+from threading import Thread, Lock
+from matplotlib import pyplot as plt
 
 from PIL import Image
 from PIL import ImageFile
@@ -486,6 +489,69 @@ def createMaskFromPoints(mercator_list, width, height):
     return mask
 
 
+# --------------------- 数据下载地址 ------------------------------------------
+
+
+# 获取所有数据json文件
+
+def download_Json(url, savePath):
+    print("-----------正在下载json文件 %s" % (url))
+    try:
+        # 将响应信息进行json格式化
+        # response = requests.get(url)
+        # versionInfo = response.text
+        # versionInfoPython = json.loads(versionInfo)
+
+        HEADERS = {'User-Agent': random.choice(agents)}
+        header = ur.Request(url, headers=HEADERS)
+        try:
+            data = ur.urlopen(header).read()
+            versionInfoPython = json.loads(data)
+            # print(versionInfo)
+            path = str(savePath)
+            # 将json格式化的数据保存
+            with open(path, 'w', encoding='utf-8') as f1:
+                f1.write(json.dumps(versionInfoPython, indent=4))
+            print("下载成功，文件保存位置：" + path)
+            return versionInfoPython
+        except Exception as ex:
+            print("Bad network link.", url, ex)
+
+    except Exception as ex:
+        print("--------下载出错----")
+        print(ex)
+        return None
+
+
+def saveBoundaryPic(jsonFile, savePath):
+    # 保存在本地的geoJson数据
+    data1 = geopandas.read_file(jsonFile)
+
+    fig, ax = plt.subplots()
+    data1.plot(ax=ax, color="#FDECD2", alpha=0.8)  # 透明样式alpha=0.8
+    # 绘制bbox框示意，进行重点标记（可以进行注释）
+    # ax = geopandas.GeoSeries([geometry.box(minx=100,  # 红框经度（小）
+    #                                        maxx=130,  # 红框经度（大）
+    #                                        miny=25,  # 红框纬度（小）
+    #                                        maxy=40)  # 红框纬度（大）
+    #                           .boundary]).plot(ax=ax, color='red')
+    plt.savefig(savePath)  # 保存图片到项目images路径下
+    plt.show()
+
+
+def saveShapefile(file_path, output_shapefile_name):
+    try:
+        data = geopandas.read_file(str(file_path))
+        ax = data.plot()
+        plt.show()  # 显示生成的地图
+        localPath = str(output_shapefile_name)  # 用于存放生成的文件
+        data.to_file(localPath, driver='ESRI Shapefile', encoding='utf-8')
+        print("--保存成功，文件存放位置："+localPath)
+    except Exception as ex:
+        print("--------JSON文件不存在，请检查后重试！----")
+        pass
+
+
 # ---------------------2019全国行政区域shape文件读取-----------------------------
 
 def getShpFile(shapefilename):
@@ -660,7 +726,7 @@ def downloadShpDemo():
     saveTif(datas, trans, image_shape, outfile)
 
 
-def downloadShpDemo2():
+def downloadShpDemoWithMask():
 
     source = 'google'
     style = 's'
@@ -717,6 +783,100 @@ def downloadShpDemo2():
     saveTif(datas, trans, image_shape, outfile, mask=mask)
 
 
+def downloadJsonDemo(url, name):
+    # 从datav中查找, 无偏移的，offset一定要设置为true
+    url = 'https://geo.datav.aliyun.com/areas_v3/bound/330383.json'
+    name = '龙港市'
+
+    source = 'google'
+    style = 's'
+    zoom = 12
+    offset = False
+    geo_name = name
+    use_mask = True  # 是否使用mask
+    gcj2wgs = True  # url是无偏移，所以如果要下有偏移的，就先把gps从gcj转回wgs
+
+    saveDir = '{}_{}'.format(name, time.strftime(
+        '%Y%m%d%H%M%S', time.localtime(time.time())))
+    if not os.path.exists(saveDir):
+        os.makedirs(saveDir)
+        print('创建文件夹', saveDir)
+
+    jsonSavePath = saveDir+'/'+name+'.json'
+    pngSavePath = saveDir+'/'+name+'.png'
+    shpSavePath = saveDir+'/'+name
+    cityJson = download_Json(url, jsonSavePath)
+    if cityJson is None:
+        return
+
+    saveBoundaryPic(jsonSavePath, pngSavePath)
+    saveShapefile(jsonSavePath, shpSavePath)
+
+    geo_bbox = [1000, 1000, -1000, -1000]
+    boundary = np.array(cityJson['features'][0]['geometry']['coordinates'])
+
+    for points_list in boundary:
+        for points in points_list:
+            for point in points:
+                geo_bbox[0] = min(geo_bbox[0], point[0])
+                geo_bbox[1] = min(geo_bbox[1], point[1])
+                geo_bbox[2] = max(geo_bbox[2], point[0])
+                geo_bbox[3] = max(geo_bbox[3], point[1])
+
+    if gcj2wgs:
+        geo_bbox[0], geo_bbox[1] = gcj_to_wgs(geo_bbox[0], geo_bbox[1])
+        geo_bbox[2], geo_bbox[3] = gcj_to_wgs(geo_bbox[2], geo_bbox[3])
+    print('geobox',geo_bbox)
+
+    w_lon = geo_bbox[0]
+    n_lat = geo_bbox[3]
+    e_lon = geo_bbox[2]
+    s_lat = geo_bbox[1]
+
+    gps_bbox = [w_lon, n_lat,
+                e_lon, s_lat]
+    print('gps_bbox',gps_bbox)
+
+    tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
+    # print(tiles, tile_bbox, image_shape)
+    urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
+
+    mercator_bbox = getExtent(tile_bbox, zoom, mode='tile')
+    trans = getTransform(mercator_bbox, image_shape)
+    print('mercator bbox is', mercator_bbox)
+    print('geotransform is', trans)
+    datas = downTiles(urls)
+
+    print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
+          (image_shape[0], image_shape[1]))
+
+    # 将wgs84转为墨卡托坐标
+    mercator_boundary_list = []
+    for points_list in boundary:
+        mercator_points_list = []
+        for points in points_list:
+            mercator_points = []
+            for point in points:
+                if gcj2wgs:
+                    point[0], point[1] = gcj_to_wgs(point[0], point[1])
+                x, y = wgs_to_mercator(point[0], point[1])
+                x, y = geo2imagexy(trans, x, y)
+                mercator_points.append([x, y])
+            mercator_points_list.append(mercator_points)
+        mercator_boundary_list.append(mercator_points_list)
+
+    mask = None
+    if use_mask:
+        mask = createMaskFromPoints(
+            mercator_boundary_list, image_shape[1],  image_shape[0])
+
+    gl = 'gl' if offset else ' nogl'
+    outfile = '{}/{}_{}{}_{}_{}.tif'.format(saveDir,
+                                            source, zoom, style, gl, geo_name)
+    saveTif(datas, trans, image_shape, outfile, mask=mask)
+
+
 if __name__ == "__main__":
     # downloadRectDemo()
-    downloadShpDemo2()
+    # downloadShpDemoWithMask()
+    downloadJsonDemo('', '')
