@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import io
 import os
 import re
@@ -10,10 +11,13 @@ import random
 import requests
 import shapefile
 import geopandas
+import shutil
 import numpy as np
 import urllib.request as ur
 
 from osgeo import gdal, ogr
+from osgeo.gdalconst import *
+
 from shapely import geometry
 from threading import Thread, Lock
 from matplotlib import pyplot as plt
@@ -26,15 +30,18 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 MAP_URLS = {
-    "google": "http://mt{server}.google.cn/vt/lyrs={style}&hl=zh-CN{offset}&src=app&x={x}&y={y}&z={z}",
+    "google1": "http://mt{server}.google.cn/vt/lyrs={style}&hl=zh-CN{offset}&src=app&x={x}&y={y}&z={z}",
+    "google2": "https://gac-geo.googlecnapps.cn/maps/vt/lyrs={style}&hl=zh-CN{offset}&src=app&x={x}&y={y}&z={z}",
+    "google3": "http://www.google.cn/maps/vt/lyrs={style}&hl=zh-CN{offset}&src=app&x={x}&y={y}&z={z}",
     "amap": "http://wprd02.is.autonavi.com/appmaptile?style={style}&x={x}&y={y}&z={z}",
     "tencent_s": "http://p3.map.gtimg.com/sateTiles/{z}/{fx}/{fy}/{x}_{y}.jpg",
     "tencent_m": "http://rt0.map.gtimg.com/tile?z={z}&x={x}&y={y}&styleid=3"
 }
 
-
-COUNT = 0
+HIT_COUNT = 0
+PROCESS_COUNT = 0
 mutex = Lock()
+
 
 # ------------------wgs84与web墨卡托互转-------------------------
 
@@ -79,7 +86,6 @@ def wgs84_to_tile(lon, lat, z):
          |              |
     -----|---->  =>>    |
          |              v
-
     Get google-style tile cooridinate from geographical coordinate
     lon : Longittude
     lat : Latitude
@@ -273,64 +279,100 @@ agents = [
 
 class Downloader(Thread):
     # multiple threads downloader
-    def __init__(self, index, count, urls, datas, update):
-        # index 表示第几个线程，count 表示线程的总数，urls 代表需要下载url列表，datas代表要返回的数据列表。
+    def __init__(self, index, PROCESS_COUNT, urls, datas, update, cache_path=None, use_cache=False, use_global_pos=True):
+        # index 表示第几个线程，PROCESS_COUNT 表示线程的总数，urls 代表需要下载url列表，datas代表要返回的数据列表。
         # update 表示每下载一个成功就进行的回调函数。
         super().__init__()
         self.urls = urls
         self.datas = datas
         self.index = index
-        self.count = count
+        self.PROCESS_COUNT = PROCESS_COUNT
         self.update = update
         self.pos = None
+        self.cache_path = cache_path
+        self.use_cache = use_cache
+        self.use_global_pos = use_global_pos
 
-    def download(self, url):
+    def download(self, urls):
         HEADERS = {'User-Agent': random.choice(agents)}
         # print(url)
 
-        err = 0
-        while(err < 4):
-            full_url = url.format(server=err)  # 如果下载失败，则切换服务器
+        for full_url in urls:
             header = ur.Request(full_url, headers=HEADERS)
             try:
                 # print('download ', full_url)
+                # if self.pos[0] != 162 or self.pos[1] != 0:
+                #     return self.pos, None
                 data = ur.urlopen(header).read()
             except:
-                err += 1
-                print("Bad network link.", full_url)
+                print("\nBad network link.", full_url)
             else:
                 return self.pos, data
         # raise Exception("Bad network link.")
-        print("Bad network link.", url)
-        return None
+        print("\nBad network link.", urls[0])
+        return self.pos, None
 
     def run(self):
-        for i, (x, y, url) in enumerate(self.urls):
-            if i % self.count != self.index:
+        for i, (x, y, tile_x, tile_y, url) in enumerate(self.urls):
+            if i % self.PROCESS_COUNT != self.index:
                 continue
-            self.pos = [x, y]
-            self.datas[i] = self.download(url)
+            hit = False
+            self.pos = [x, y, tile_x, tile_y]
+            if self.cache_path is not None:
+                pos_x = x - tile_x
+                pox_y = y - tile_y
+                if self.use_global_pos:
+                    pos_x = x
+                    pox_y = y
+                name = os.path.join(
+                    self.cache_path, '{}x{}.png'.format(pos_x, pox_y))
+
+                if self.use_cache:  # 如果使用缓存直接返回数据路径，否则下载
+                    if not os.path.exists(name):  # 如果已经存在缓存数据则不下载，不存在则补充下载
+                        pos, data = self.download(url)
+                        if data is not None:  # 如果下载不到，也没有办法
+                            picio = io.BytesIO(data)
+                            picpil = Image.open(picio)
+                            picpil.save(name)
+                            hit = True
+                    else:
+                        hit = True
+                else:
+                    pos, data = self.download(url)
+                    if data is not None:  # 如果下载不到，也没有办法
+                        picio = io.BytesIO(data)
+                        picpil = Image.open(picio)
+                        picpil.save(name)
+                        hit = True
+
+                self.datas[i] = (self.pos, name, url[0])
+            else:
+                pos, data = self.download(url)
+                self.datas[i] = (self.pos, data, url[0])
             if mutex.acquire():
-                self.update()
+                self.update(hit)
                 mutex.release()
 
 
-def downTiles(urls, multi=10):
+def downTiles(urls, cache_path=None, use_cache=False, use_global_pos=True, multi=20):
 
     def makeupdate(s):
-        def up():
-            global COUNT
-            COUNT += 1
-            print("\b"*45, end='')
-            print("DownLoading ... [{0}/{1}]".format(COUNT, s), end='')
+        def up(hit):
+            global PROCESS_COUNT, HIT_COUNT
+            PROCESS_COUNT += 1
+            if hit:
+                HIT_COUNT += 1
+            print("\b"*57, end='')
+            print(
+                "DownLoading ... [hit:{0}/proc:{1}/total:{2}]".format(HIT_COUNT, PROCESS_COUNT, s), end='')
         return up
 
     url_len = len(urls)
     datas = [None] * url_len
-    if multi < 1 or multi > 20 or not isinstance(multi, int):
+    if multi < 1 or multi > 32 or not isinstance(multi, int):
         raise Exception(
             "multi of Downloader shuold be int and between 1 to 20.")
-    tasks = [Downloader(i, multi, urls, datas, makeupdate(url_len))
+    tasks = [Downloader(i, multi, urls, datas, makeupdate(url_len), cache_path, use_cache, use_global_pos)
              for i in range(multi)]
     for i in tasks:
         i.start()
@@ -353,25 +395,37 @@ def geturl(source, x, y, z, style, offset):
     z:
         zoom
     '''
+    furls = []
     if source == 'google':
         offset = '&gl=CN' if offset else ''
-        furl = MAP_URLS["google"].format(
-            server='{server}', x=x, y=y, z=z, style=style, offset=offset)
+        for server in range(0, 4):
+            furl = MAP_URLS["google1"].format(
+                server=server, x=x, y=y, z=z, style=style, offset=offset)
+            furls.append(furl)
+        furl = MAP_URLS["google2"].format(
+            x=x, y=y, z=z, style=style, offset=offset)
+        furls.append(furl)
+        furl = MAP_URLS["google3"].format(
+            x=x, y=y, z=z, style=style, offset=offset)
+        furls.append(furl)
     elif source == 'amap':
         # for amap 6 is satellite and 7 is map.
         style = 6 if style == 's' else 7
         furl = MAP_URLS["amap"].format(x=x, y=y, z=z, style=style)
+        furls.append(furl)
     elif source == 'tencent':
         y = 2**z - 1 - y
         if style == 's':
             furl = MAP_URLS["tencent_s"].format(
                 x=x, y=y, z=z, fx=math.floor(x / 16), fy=math.floor(y / 16))
+            furls.append(furl)
         else:
             furl = MAP_URLS["tencent_m"].format(x=x, y=y, z=z)
+            furls.append(furl)
     else:
         raise Exception("Unknown Map Source ! ")
 
-    return furl
+    return furls
 
 
 def getTilesByBBox(bbox, zoom):
@@ -385,6 +439,10 @@ def getTilesByBBox(bbox, zoom):
     lenx = pos2x - pos1x + 1
     leny = pos2y - pos1y + 1
     print("Total number：{x} X {y}".format(x=lenx, y=leny))
+    print("Pixel W x H is {} x {}".format(lenx*256, leny*256))
+    mb = lenx*256 / 1024 * leny*256 / 1024 * 3
+    gb = mb / 1024
+    print("Maybe memory use {mb} MB or {gb} G".format(mb=mb, gb=gb))
 
     tiles = []
     for y in range(pos1y, pos2y+1):
@@ -399,7 +457,7 @@ def getUrlsByTiles(tiles, tile_bbox, zoom, source='google', style='s', offset=Fa
     urls = []
     for x, y in tiles:
         url = geturl(source, x, y, zoom, style, offset)
-        urls.append([x-pos1x, y-pos1y, url])
+        urls.append([x, y, pos1x, pos1y, url])
     return urls
 
 
@@ -433,43 +491,134 @@ def getTransform(mercator_bbox, image_shape):
     return trans
 
 
-def saveTif(datas, im_geotrans, image_shape, outfile, mask=None):
+def make_overview(outfile, width, height):
+
+    filename, ext = os.path.splitext(outfile)
+    out_overview_file = filename+'_overview'+ext
+
+    dataset = gdal.Open(outfile)
+    if(dataset == None):
+        print("Make overview error!")
+        return
+    bands = dataset.RasterCount
+
+    # driver = gdal.GetDriverByName("GTiff")
+    # tods = driver.Create(out_overview_file, 1024, int(1024/width*height), 3 ,options=["INTERLEAVE=PIXEL"])
+    # tods.SetGeoTransform(dataset.GetGeoTransform())
+    # tods.SetProjection(dataset.GetProjection())
+    # gdal.ReprojectImage(dataset, tods, dataset.GetProjection(), tods.GetProjection(), GRA_Cubic)
+
+    datas = []
+    overview_size = 1024.0
+    overview_width = int(overview_size)
+    overview_height = int(overview_size/width*height)
+    print('Overview width x height is (%d, %d)' %
+          (overview_width, overview_height))
+    for i in range(bands):
+        band = dataset.GetRasterBand(i+1)
+        data = band.ReadAsArray(0, 0, width, height,
+                                overview_width, overview_height)
+        datas.append(np.reshape(data, (1, -1)))
+    datas = np.concatenate(datas)
+    driver = gdal.GetDriverByName("GTiff")
+    tods = driver.Create(out_overview_file, overview_width,
+                         overview_height, bands, options=["INTERLEAVE=PIXEL"])
+    tods.WriteRaster(0, 0, overview_width, overview_height, datas.tobytes(
+    ), overview_width, overview_height, band_list=[1, 2, 3])
+    del tods
+
+    del dataset
+
+
+def single_save(outfile, idx, data, x, y):
+    dataset = gdal.Open(outfile)
+    if(dataset != None):
+        dataset.GetRasterBand(idx).WriteArray(data, x, y)
+        del dataset
+
+
+def saveTif(datas, im_geotrans, image_shape, outfile, use_cache=False, mask=None):
     # 创建文件
     height, width = image_shape
     datatype = gdal.GDT_Byte
     driver = gdal.GetDriverByName("GTiff")
     dataset = driver.Create(outfile, width, height, 3, datatype)
     print('save', outfile)
-    bands = 0
-    if(dataset != None):
-        dataset.SetGeoTransform(im_geotrans)  # 写入仿射变换参数
-        # dataset.SetProjection(im_proj) #写入投影
 
+    f = open(outfile+'.log', 'w')
+
+    bands = 0
+    im_proj = 'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["X",EAST],AXIS["Y",NORTH],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]'
+    if(dataset == None):
+        print("Can not save %s" % outfile)
+        return
+
+    dataset.SetGeoTransform(im_geotrans)  # 写入仿射变换参数
+    dataset.SetProjection(im_proj)  # 写入投影
+
+    with ProcessPoolExecutor(max_workers=32) as executor:
+        future_list = []
         for index, result in enumerate(datas):
             if result is None:
                 continue
 
-            pos, data = result
-            x, y = pos
-            picio = io.BytesIO(data)
-            picpil = Image.open(picio)
-            data = np.array(picpil, dtype=np.uint8)
+            pos, data, url = result
+            x, y, tile_x, tile_y = pos
+
+            if use_cache:
+                # if data is None:
+                #     f.write('read error, pos %d %d, %s\n'%(x, y, data))
+                if os.path.exists(data):
+                    try:
+                        picpil = Image.open(data)
+                        im = np.array(picpil, dtype=np.uint8)
+                    except:
+                        print('read %s error', data)
+                        f.write('read error, pos (%d %d), tile ul(%d, %d), %s, url: %s\n' % (
+                            x, y, tile_x, tile_y, data, url))
+                        continue
+                else:
+                    f.write('read error, pos (%d, %d), tile ul(%d, %d), %s, url: %s\n' % (
+                        x, y, tile_x, tile_y, data, url))
+                    continue
+            else:
+                picio = io.BytesIO(data)
+                picpil = Image.open(picio)
+                im = np.array(picpil, dtype=np.uint8)
             # print(pos, data.shape)
             # print(x*256, y*256)
-            _, _, bands = data.shape
+            _, _, bands = im.shape
             for c in range(bands):
                 dataset.GetRasterBand(
-                    c + 1).WriteArray(data[:, :, c], x*256, y*256)
+                    c + 1).WriteArray(im[:, :, c], (x-tile_x)*256, (y-tile_y)*256)
+
+        #         f1 = executor.submit(single_save, outfile, c+1, im[:,:,c], (x-tile_x)*256, (y-tile_y)*256 )
+        #         future_list.append(f1)
+        # for future in as_completed(future_list):
+        #     future.result()
+
+            print("\b"*50, end='')
+            print(
+                "Write data to tif ... [{0}/{1}]".format(index+1, len(datas)), end='')
+    print()
+    del dataset
 
     if mask is not None:
-        for c in range(bands):
-            band_data = dataset.GetRasterBand(
-                c + 1).ReadAsArray(0, 0, width, height)
-            band_data[mask == 0] = 0
-            dataset.GetRasterBand(
-                c + 1).WriteArray(band_data, 0, 0)
+        dataset = gdal.Open(outfile)
+        if(dataset != None):
+            for c in range(bands):
+                band_data = dataset.GetRasterBand(
+                    c + 1).ReadAsArray(0, 0, width, height)
+                band_data[mask == 0] = 0
+                dataset.GetRasterBand(
+                    c + 1).WriteArray(band_data, 0, 0)
+            del dataset
 
-    del dataset
+    # 缩略图制作
+    print('Make overview picture ...')
+    make_overview(outfile, width, height)
+
+    f.close()
 
 
 def createMaskFromPoints(mercator_list, width, height):
@@ -543,7 +692,7 @@ def saveShapefile(file_path, output_shapefile_name):
     try:
         data = geopandas.read_file(str(file_path))
         ax = data.plot()
-        plt.show()  # 显示生成的地图
+        # plt.show()  # 显示生成的地图
         localPath = str(output_shapefile_name)  # 用于存放生成的文件
         data.to_file(localPath, driver='ESRI Shapefile', encoding='utf-8')
         print("--保存成功，文件存放位置："+localPath)
@@ -552,7 +701,23 @@ def saveShapefile(file_path, output_shapefile_name):
         pass
 
 
+def saveInfo(infoSavePath, image_shape, mercator_bbox, trans):
+    f = open(infoSavePath, 'w')
+    f.write(
+        "Tiles h*w: {}x{}\n".format(image_shape[0]/256, image_shape[1]/256))
+    f.write("Pixel h*w: {}x{}\n".format(image_shape[0], image_shape[1]))
+    f.write("Area : {} (km)^2\n".format(
+        image_shape[0] / 1000 * image_shape[1] / 1000 * trans[1] * trans[1]))
+    f.write("mercator_bbox ({},{}), ({},{})\n".format(
+        mercator_bbox[0], mercator_bbox[1], mercator_bbox[2], mercator_bbox[3]))
+    f.write("geotrans [{},{},{},{},{},{}]\n".format(
+        trans[0], trans[1], trans[2], trans[3], trans[4], trans[5]))
+    mb = image_shape[0] / 1024 * image_shape[1] / 1024 * 3
+    gb = mb / 1024
+    f.write("Maybe memory use {mb} MB or {gb} G\n".format(mb=mb, gb=gb))
+    f.close()
 # ---------------------2019全国行政区域shape文件读取-----------------------------
+
 
 def getShpFile(shapefilename):
 
@@ -563,14 +728,14 @@ def getShpFile(shapefilename):
 
 
 def initBorder():
-    county_border_shapes, county_area_infors = getShpFile(
+    PROCESS_COUNTy_border_shapes, PROCESS_COUNTy_area_infors = getShpFile(
         "D:\\迅雷下载\\区划\\区划\\县.shp")
     city_border_shapes, city_area_infors = getShpFile(
         "D:\\迅雷下载\\区划\\区划\\市.shp")
     province_border_shapes, province_area_infors = getShpFile(
         "D:\\迅雷下载\\区划\\区划\\省.shp")
 
-    return [[county_border_shapes, county_area_infors],
+    return [[PROCESS_COUNTy_border_shapes, PROCESS_COUNTy_area_infors],
             [city_border_shapes, city_area_infors],
             [province_border_shapes, province_area_infors]]
 
@@ -609,19 +774,19 @@ def getShpFileByGDAL(shapefile, query_name):
         return "打开文件失败！"
 
     # 获取数据源中的图层个数，shp数据图层只有一个，gdb、dxf会有多个
-    iLayerCount = ds.GetLayerCount()
-    print("\t图层个数 = ", iLayerCount)
+    iLayerPROCESS_COUNT = ds.GetLayerPROCESS_COUNT()
+    print("\t图层个数 = ", iLayerPROCESS_COUNT)
     # 获取第一个图层
     result = []
     bbox = [10000, 10000, -10000, -10000]
-    for layerIdx in range(iLayerCount):
+    for layerIdx in range(iLayerPROCESS_COUNT):
         oLayer = ds.GetLayerByIndex(layerIdx)
         if oLayer == None:
             return "获取图层失败！"
         # 对图层进行初始化
         oLayer.ResetReading()
         # 输出图层中的要素个数
-        num = oLayer.GetFeatureCount(0)
+        num = oLayer.GetFeaturePROCESS_COUNT(0)
         print("\t要素个数 = ", num)
         result_list = []
         # 获取要素
@@ -632,8 +797,8 @@ def getShpFileByGDAL(shapefile, query_name):
 
             if query_name in name:
 
-                count = ofeature.GetGeometryRef().GetGeometryCount()
-                for gemIdx in range(count):
+                PROCESS_COUNT = ofeature.GetGeometryRef().GetGeometryPROCESS_COUNT()
+                for gemIdx in range(PROCESS_COUNT):
                     gemo = ofeature.GetGeometryRef().GetGeometryRef(gemIdx)
                     gemo_data = gemo.ExportToJson()
                     gemo_json = json.loads(gemo_data)
@@ -655,14 +820,33 @@ def getShpFileByGDAL(shapefile, query_name):
     return result, bbox
 
 
-def downloadRectDemo():
-    source = 'google'
-    style = 's'
-    zoom = 18
-    offset = False
-    geo_name = 'test'
-    gps_bbox = [120.09198099000002, 27.176422685000115,
-                120.09819027500012, 27.173431772500086]
+def downloadRectDemo(geo_name, left, top, right, bottom, source='google', style='s', zoom=12, offset=False, cache_path=None, use_cache=True, outPath='.', use_global_pos=False, force_save=True):
+    # source = 'google'
+    # style = 's'
+    # zoom = 18
+    # offset = False
+    # geo_name = 'test'
+    global PROCESS_COUNT, HIT_COUNT
+    PROCESS_COUNT = 0
+    HIT_COUNT = 0
+    if cache_path is not None:
+        if use_global_pos:
+            cache_path = os.path.join(cache_path, '%s_%d' % (source, zoom))
+        else:
+            cache_path = os.path.join(
+                cache_path, '%s_%s_%d' % (name, source, zoom))
+        if not os.path.exists(cache_path):
+            os.makedirs(cache_path)
+
+    ulx = parse_dms(left)
+    uly = parse_dms(top)
+    lrx = parse_dms(right)
+    lry = parse_dms(bottom)
+
+    gps_bbox = [ulx, uly, lrx, lry]
+
+    # gps_bbox = [120.09198099000002, 27.176422685000115,
+    #             120.09819027500012, 27.173431772500086]
 
     tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
     urls = getUrlsByTiles(tiles, tile_bbox, zoom, source, style, offset)
@@ -672,14 +856,28 @@ def downloadRectDemo():
     print('mercator bbox is', mercator_bbox)
     print('geotransform is', trans)
     # print(image_shape)
-    datas = downTiles(urls)
+    saveInfo(infoSavePath, image_shape, mercator_bbox, trans)
+
+    datas = downTiles(urls, cache_path=cache_path,
+                      use_cache=use_cache, use_global_pos=use_global_pos, multi=20)
 
     print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
           (image_shape[0], image_shape[1]))
 
-    gl = 'gl' if offset else ' nogl'
+    if HIT_COUNT != PROCESS_COUNT:
+        print("DownLoading %d but total %d !!!!" % (HIT_COUNT, PROCESS_COUNT))
+        if not force_save:
+            print("Shutdown !!!!")
+            return
+
+    gl = 'gl' if offset else 'nogl'
     outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
-    saveTif(datas, trans, image_shape, outfile)
+    outfile = os.path.join(outPath, outfile)
+    use_cache = True if cache_path is not None else False
+    saveTif(datas, trans, image_shape, outfile, use_cache=use_cache)
+
+    # if os.path.exists(cache_path):
+    #     shutil.rmtree(cache_path)
 
 
 def downloadShpDemo():
@@ -688,7 +886,7 @@ def downloadShpDemo():
     zoom = 18
     offset = False
     geo_name = '苍南县'
-
+    PROCESS_COUNT = 0
     datasets = initBorder()
     boarders = getBoarderFromDataset(geo_name, datasets)
     if boarders is None:
@@ -721,7 +919,7 @@ def downloadShpDemo():
     print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
           (image_shape[0], image_shape[1]))
 
-    gl = 'gl' if offset else ' nogl'
+    gl = 'gl' if offset else 'nogl'
     outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
     saveTif(datas, trans, image_shape, outfile)
 
@@ -733,7 +931,7 @@ def downloadShpDemoWithMask():
     zoom = 12
     offset = False
     geo_name = '苍南县'
-
+    PROCESS_COUNT = 0
     boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\县.shp", geo_name)
     # boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\市.shp", geo_name)
     # boundary, geo_bbox = getShpFileByGDAL("D:\\迅雷下载\\区划\\区划\\省.shp", geo_name)
@@ -778,55 +976,80 @@ def downloadShpDemoWithMask():
     mask = createMaskFromPoints(
         mercator_boundary_list, image_shape[1],  image_shape[0])
 
-    gl = 'gl' if offset else ' nogl'
+    gl = 'gl' if offset else 'nogl'
     outfile = '{}_{}{}_{}_{}.tif'.format(source, zoom, style, gl, geo_name)
     saveTif(datas, trans, image_shape, outfile, mask=mask)
 
+# url：geojson路径, name：保存名字, source：数据源, style：卫星影像或是地图, zoom：等级, offset：是否偏移, use_mask：是否使用掩码
+# gcj2wgs：如果有偏移是否转换, outPath：输出路径, cache_path：缓存路径, use_cache：是否使用缓存数据, include_list：geojson中包含多个城市，使用哪几个城市
+# use_global_pos： 缓存时是否使用全球瓦片坐标, force_save：下载不完全，是否强制写
 
-def downloadJsonDemo(url, name):
+
+def downloadJsonDemo(url, name, source='google', style='s', zoom=18, offset=False, use_mask=False, gcj2wgs=True, outPath='.', cache_path=None, use_cache=True, use_global_pos=False, include_list=[], force_save=True):
     # 从datav中查找, 无偏移的，offset一定要设置为true
-    url = 'https://geo.datav.aliyun.com/areas_v3/bound/330383.json'
-    name = '龙港市'
+    # url = 'https://geo.datav.aliyun.com/areas_v3/bound/330383.json'
+    # name = '龙港市'
 
-    source = 'google'
-    style = 's'
-    zoom = 12
-    offset = False
+    # source = 'google'
+    # style = 's'
+    # zoom = 12
+    # offset = False
     geo_name = name
-    use_mask = True  # 是否使用mask
-    gcj2wgs = True  # url是无偏移，所以如果要下有偏移的，就先把gps从gcj转回wgs
+    # use_mask = True  # 是否使用mask
+    # gcj2wgs = True  # url是无偏移，所以如果要下有偏移的，就先把gps从gcj转回wgs
+    global PROCESS_COUNT, HIT_COUNT
+    PROCESS_COUNT = 0
+    HIT_COUNT = 0
+    if cache_path is not None:
+        if use_global_pos:
+            cache_path = os.path.join(cache_path, '%s_%d' % (source, zoom))
+        else:
+            cache_path = os.path.join(
+                cache_path, '%s_%s_%d' % (name, source, zoom))
+        if not os.path.exists(cache_path):
+            os.makedirs(cache_path)
+            print('创建文件夹', cache_path)
 
     saveDir = '{}_{}'.format(name, time.strftime(
         '%Y%m%d%H%M%S', time.localtime(time.time())))
+    saveDir = os.path.join(outPath, saveDir)
     if not os.path.exists(saveDir):
         os.makedirs(saveDir)
         print('创建文件夹', saveDir)
 
     jsonSavePath = saveDir+'/'+name+'.json'
     pngSavePath = saveDir+'/'+name+'.png'
+    infoSavePath = saveDir+'/'+name+'.xml'
     shpSavePath = saveDir+'/'+name
     cityJson = download_Json(url, jsonSavePath)
     if cityJson is None:
         return
 
-    saveBoundaryPic(jsonSavePath, pngSavePath)
+    # saveBoundaryPic(jsonSavePath, pngSavePath)
     saveShapefile(jsonSavePath, shpSavePath)
 
     geo_bbox = [1000, 1000, -1000, -1000]
-    boundary = np.array(cityJson['features'][0]['geometry']['coordinates'])
 
-    for points_list in boundary:
-        for points in points_list:
-            for point in points:
-                geo_bbox[0] = min(geo_bbox[0], point[0])
-                geo_bbox[1] = min(geo_bbox[1], point[1])
-                geo_bbox[2] = max(geo_bbox[2], point[0])
-                geo_bbox[3] = max(geo_bbox[3], point[1])
+    for cityItem in cityJson['features']:
+
+        if cityItem['properties']['name'] not in include_list:
+            continue
+        print('adcode:{}, name:{},center:[{},{}],centeroid:[{},{}],parent adcode:{}'.format(cityItem['properties']['adcode'], cityItem['properties']['name'], cityItem['properties']
+                                                                                            ['center'][0], cityItem['properties']['center'][1], cityItem['properties']['centroid'][0], cityItem['properties']['centroid'][1], cityItem['properties']['parent']['adcode']))
+
+        boundary = np.array(cityItem['geometry']['coordinates'])
+        for points_list in boundary:
+            for points in points_list:
+                for point in points:
+                    geo_bbox[0] = min(geo_bbox[0], point[0])
+                    geo_bbox[1] = min(geo_bbox[1], point[1])
+                    geo_bbox[2] = max(geo_bbox[2], point[0])
+                    geo_bbox[3] = max(geo_bbox[3], point[1])
 
     if gcj2wgs:
         geo_bbox[0], geo_bbox[1] = gcj_to_wgs(geo_bbox[0], geo_bbox[1])
         geo_bbox[2], geo_bbox[3] = gcj_to_wgs(geo_bbox[2], geo_bbox[3])
-    print('geobox',geo_bbox)
+    print('geobox', geo_bbox)
 
     w_lon = geo_bbox[0]
     n_lat = geo_bbox[3]
@@ -835,7 +1058,7 @@ def downloadJsonDemo(url, name):
 
     gps_bbox = [w_lon, n_lat,
                 e_lon, s_lat]
-    print('gps_bbox',gps_bbox)
+    print('gps_bbox', gps_bbox)
 
     tiles, tile_bbox, image_shape = getTilesByBBox(gps_bbox, zoom)
     # print(tiles, tile_bbox, image_shape)
@@ -845,38 +1068,68 @@ def downloadJsonDemo(url, name):
     trans = getTransform(mercator_bbox, image_shape)
     print('mercator bbox is', mercator_bbox)
     print('geotransform is', trans)
-    datas = downTiles(urls)
+    saveInfo(infoSavePath, image_shape, mercator_bbox, trans)
+
+    datas = downTiles(urls, cache_path=cache_path,
+                      use_cache=use_cache, use_global_pos=use_global_pos, multi=20)
 
     print("\nDownload Finished！ Pics (w,h) is (%d,%d) Mergeing......" %
           (image_shape[0], image_shape[1]))
 
-    # 将wgs84转为墨卡托坐标
-    mercator_boundary_list = []
-    for points_list in boundary:
-        mercator_points_list = []
-        for points in points_list:
-            mercator_points = []
-            for point in points:
-                if gcj2wgs:
-                    point[0], point[1] = gcj_to_wgs(point[0], point[1])
-                x, y = wgs_to_mercator(point[0], point[1])
-                x, y = geo2imagexy(trans, x, y)
-                mercator_points.append([x, y])
-            mercator_points_list.append(mercator_points)
-        mercator_boundary_list.append(mercator_points_list)
+    # # 将wgs84转为墨卡托坐标
+    # mercator_boundary_list = []
+    # for points_list in boundary:
+    #     mercator_points_list = []
+    #     for points in points_list:
+    #         mercator_points = []
+    #         for point in points:
+    #             if gcj2wgs:
+    #                 point[0], point[1] = gcj_to_wgs(point[0], point[1])
+    #             x, y = wgs_to_mercator(point[0], point[1])
+    #             x, y = geo2imagexy(trans, x, y)
+    #             mercator_points.append([x, y])
+    #         mercator_points_list.append(mercator_points)
+    #     mercator_boundary_list.append(mercator_points_list)
 
-    mask = None
-    if use_mask:
-        mask = createMaskFromPoints(
-            mercator_boundary_list, image_shape[1],  image_shape[0])
+    # mask = None
+    # if use_mask:
+    #     mask = createMaskFromPoints(
+    #         mercator_boundary_list, image_shape[1],  image_shape[0])
 
-    gl = 'gl' if offset else ' nogl'
+    if HIT_COUNT != PROCESS_COUNT:
+        print("DownLoading %d but total %d !!!!" % (HIT_COUNT, PROCESS_COUNT))
+        if not force_save:
+            print("Shutdown !!!!")
+            return
+    # print(HIT_COUNT, PROCESS_COUNT)
+
+    gl = 'gl' if offset else 'nogl'
     outfile = '{}/{}_{}{}_{}_{}.tif'.format(saveDir,
                                             source, zoom, style, gl, geo_name)
-    saveTif(datas, trans, image_shape, outfile, mask=mask)
+    use_cache = True if cache_path is not None else False
+    saveTif(datas, trans, image_shape, outfile, use_cache=use_cache, mask=None)
+
+    # if os.path.exists(cache_path):
+    #     shutil.rmtree(cache_path)
 
 
+# https://datav.aliyun.com/portal/school/atlas/area_selector
 if __name__ == "__main__":
     # downloadRectDemo()
     # downloadShpDemoWithMask()
-    downloadJsonDemo('', '')
+    # downloadRectDemo('test', left='11^11^22.33N', top='11^11^22.33N', right='11^11^22.33N', bottom='11^11^22.33N', source = 'google', style = 's', zoom=12, offset = False, outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, use_global_pos=False, force_save=False)
+
+    # downloadJsonDemo(name='洛阳市',         url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', include_list=[], outPath='I:\\remote')
+    # downloadJsonDemo(name='洛阳市_主城区',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['老城区','西工区','瀍河回族区','涧西区','孟津区','洛龙区','偃师区'])
+    # downloadJsonDemo(name='洛阳市_宜阳县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['宜阳县'])
+    # downloadJsonDemo(name='洛阳市_新安县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['新安县'])
+    # downloadJsonDemo(name='洛阳市_伊川县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['伊川县'])
+    # downloadJsonDemo(name='洛阳市_汝阳县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['汝阳县'])
+    # downloadJsonDemo(name='洛阳市_新安宜阳', url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['新安县','宜阳县'])
+    # downloadJsonDemo(name='洛阳市_伊川汝阳', url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['伊川县','汝阳县'])
+    # downloadJsonDemo(name='洛阳市_洛宁县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['洛宁县'])
+    # downloadJsonDemo(name='洛阳市_嵩县',     url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['嵩县'])
+    # downloadJsonDemo(name='洛阳市_栾川县',   url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=410300_full', outPath='I:\\remote', zoom=18, cache_path='I:\\remote\\cache1', use_cache=True, source='google', use_global_pos=False, force_save=False, include_list=['栾川县'])
+
+    downloadJsonDemo(name='邢台市_襄都信都', url='https://geo.datav.aliyun.com/areas_v3/bound/geojson?code=130500_full', outPath='I:\\remote',
+                     zoom=12, cache_path='I:\\remote\\cache1', source='google', use_global_pos=True, force_save=True, include_list=['襄都区', '信都区'])
